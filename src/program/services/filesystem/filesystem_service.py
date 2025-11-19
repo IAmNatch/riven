@@ -117,7 +117,16 @@ class FilesystemService:
                     logger.debug(f"Media analysis completed for {episode_or_movie.log_string}")
                 except Exception as e:
                     logger.warning(f"Media analysis failed for {episode_or_movie.log_string}: {e}")
-                    # Don't fail VFS registration if analysis fails
+
+                # Check if item was reset due to dead link during media analysis
+                # When a dead link is detected, the item's filesystem_entry is cleared
+                # and a re-download is triggered. Skip this item and let the new download handle it.
+                if not episode_or_movie.filesystem_entry:
+                    logger.info(
+                        f"Item {episode_or_movie.log_string} was reset during media analysis "
+                        "(dead link detected). New download will handle media analysis and notification."
+                    )
+                    continue
 
         logger.info(f"Filesystem processing complete for {item.log_string}")
 
