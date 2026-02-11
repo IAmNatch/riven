@@ -29,6 +29,9 @@ LABEL name="Riven" \
 # Install only runtime dependencies
 RUN apk add --no-cache curl libcurl shadow unzip ffmpeg libpq fuse3 libcap libcap-utils postgresql17-client
 
+# Ensure libfuse3.so.3 symlink exists (Alpine ships .so.4 but pyfuse3 wheels expect .so.3)
+RUN ln -sf /usr/lib/libfuse3.so.3.* /usr/lib/libfuse3.so.3 2>/dev/null || true
+
 # Configure FUSE
 RUN sed -i 's/^#\s*user_allow_other/user_allow_other/' /etc/fuse.conf || \
     echo 'user_allow_other' >> /etc/fuse.conf
