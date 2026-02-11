@@ -352,6 +352,14 @@ class Program(threading.Thread):
             items_to_submit = processed_event.related_media_items
 
             if items_to_submit:
+                # When a single item is produced (normal state transitions), submit
+                # directly to the executor for immediate processing. When multiple
+                # items are produced (e.g. PartiallyCompleted show expanding into
+                # dozens of episodes), re-queue them so each item re-enters next()
+                # and competes on priority — preventing bulk expansions from starving
+                # fresh user requests.
+                submit_directly = len(items_to_submit) == 1
+
                 for item_to_submit in items_to_submit:
                     if not next_service:
                         self.em.add_event_to_queue(
@@ -375,8 +383,10 @@ class Program(threading.Thread):
                                 overrides=processed_event.overrides,
                             )
 
-                        # Event will be added to running when job actually starts in submit_job
-                        self.em.submit_job(next_service, self, event)
+                        if submit_directly:
+                            self.em.submit_job(next_service, self, event)
+                        else:
+                            self.em.add_event(event)
 
     def stop(self):
         if not self.initialized:

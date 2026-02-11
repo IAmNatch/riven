@@ -186,7 +186,7 @@ class EventManager:
                             .filter_by(id=event.item_id)
                             .options(
                                 sqlalchemy.orm.load_only(
-                                    MediaItem.id, MediaItem.last_state
+                                    MediaItem.id, MediaItem.last_state, MediaItem.scraped_times
                                 )
                             )
                             .one_or_none()
@@ -206,9 +206,10 @@ class EventManager:
                             )
                             return
 
-                        # Cache the item state in the event for efficient priority sorting
+                        # Cache the item state and scraped_times in the event for efficient priority sorting
                         if item.last_state:
                             event.item_state = item.last_state
+                        event.scraped_times = item.scraped_times or 0
 
             self._queued_events.append(event)
 
@@ -392,16 +393,18 @@ class EventManager:
         Get the next event in the queue, prioritizing items closest to completion.
 
         Priority order (highest to lowest):
-        0. Items in Completed state (closest to completion)
-        1. Items in Symlinked state
-        2. Items in Downloaded state
-        3. Items in Scraped state
-        4. Items in Indexed state
-        5. All other states
+        0. Items in Completed state (Plex update — seconds)
+        1. Items in Symlinked state (updater — seconds)
+        2. Items in Downloaded state (filesystem link — seconds)
+        3. Items in Scraped state (downloading — not scraping)
+        4. Fresh Indexed items (scraped_times == 0 — user's new request)
+        5. Items in PartiallyCompleted/Ongoing state (expands into many child scraping jobs)
+        6. Retry Indexed items (scraped_times > 0 — previously failed retries)
+        999. All other states
 
         Within each priority level, events are sorted by run_at timestamp.
 
-        Performance: Uses cached item_state from Event object to avoid database queries.
+        Performance: Uses cached item_state and scraped_times from Event object to avoid database queries.
 
         Raises:
             Empty: If the queue is empty or no events are ready to run.
@@ -424,14 +427,15 @@ class EventManager:
                         raise Empty
 
                     # Define state priority (lower number = higher priority)
+                    # Indexed is handled separately below to split fresh vs retry
                     state_priority = dict[States, int](
                         {
                             States.Completed: 0,
-                            States.PartiallyCompleted: 1,
-                            States.Symlinked: 2,
-                            States.Downloaded: 3,
-                            States.Scraped: 4,
-                            States.Indexed: 5,
+                            States.Symlinked: 1,
+                            States.Downloaded: 2,
+                            States.Scraped: 3,
+                            States.PartiallyCompleted: 5,
+                            States.Ongoing: 5,
                         }
                     )
 
@@ -439,10 +443,14 @@ class EventManager:
                         """
                         Returns a tuple for sorting: (state_priority, run_at)
                         Items with higher priority states come first, then sorted by run_at.
-                        Uses cached item_state to avoid database queries.
+                        Uses cached item_state and scraped_times to avoid database queries.
                         """
                         if event.item_state:
-                            priority = state_priority.get(event.item_state, 999)
+                            if event.item_state == States.Indexed:
+                                # Fresh items (never scraped) get priority 4, retries get 6
+                                priority = 4 if event.scraped_times == 0 else 6
+                            else:
+                                priority = state_priority.get(event.item_state, 999)
                             return (priority, event.run_at)
 
                         # Default priority for items without state or content-only events

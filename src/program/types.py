@@ -48,6 +48,7 @@ class Event:
     content_item: "MediaItem | None" = None
     run_at: datetime = datetime.now()
     item_state: States | None = None  # Cached state for priority sorting
+    scraped_times: int = 0  # Cached from DB for priority sorting (0 = fresh, >0 = retry)
     overrides: dict[str, Any] | None = None
 
     @property
