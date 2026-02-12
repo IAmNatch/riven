@@ -61,6 +61,7 @@ class EventManager:
         self._futures = list[FutureWithEvent]()
         self._queued_events = list[Event]()
         self._running_events = list[Event]()
+        self._scraper_busy = False
         self.mutex = Lock()
 
     def _find_or_create_executor(self, service_cls: Service) -> ThreadPoolExecutor:
@@ -104,69 +105,75 @@ class EventManager:
             service (type): The service class associated with the future.
         """
 
-        if future_with_event.future.cancelled():
-            if future_with_event.event:
-                logger.debug(
-                    f"Future for {future_with_event.event.log_message} was cancelled."
-                )
-            else:
-                logger.debug(f"Future for {future_with_event} was cancelled.")
-            return  # Skip processing if the future was cancelled
+        is_scraping = service.__class__.__name__ == "Scraping"
 
         try:
-            result = future_with_event.future.result()
-
-            if future_with_event in self._futures:
-                self._futures.remove(future_with_event)
-
-            sse_manager.publish_event(
-                "event_update", json.dumps(self.get_event_updates())
-            )
-
-            if isinstance(result, tuple):
-                item_id, timestamp = result
-            else:
-                item_id, timestamp = result, datetime.now()
-
-            if item_id:
+            if future_with_event.future.cancelled():
                 if future_with_event.event:
-                    self.remove_event_from_running(future_with_event.event)
-
                     logger.debug(
-                        f"Removed {future_with_event.event.log_message} from running events."
+                        f"Future for {future_with_event.event.log_message} was cancelled."
                     )
+                else:
+                    logger.debug(f"Future for {future_with_event} was cancelled.")
+                return  # Skip processing if the future was cancelled
 
-                if future_with_event.cancellation_event.is_set():
-                    logger.debug(
-                        f"Future with Item ID: {item_id} was cancelled; discarding results..."
-                    )
+            try:
+                result = future_with_event.future.result()
 
-                    return
+                if future_with_event in self._futures:
+                    self._futures.remove(future_with_event)
 
-                # Propagate overrides to the new event to maintain setting context across service transitions
-                event_overrides = future_with_event.event.overrides if future_with_event.event else None
-
-                self.add_event(
-                    Event(
-                        emitted_by=service,
-                        item_id=item_id,
-                        run_at=timestamp,
-                        overrides=event_overrides
-                    )
+                sse_manager.publish_event(
+                    "event_update", json.dumps(self.get_event_updates())
                 )
-        except Exception as e:
-            logger.error(f"Error in future for {future_with_event}: {e}")
-            logger.exception(traceback.format_exc())
 
-            # TODO(spoked): Here we should remove it from the running events so it can be retried, right?
-            # self.remove_event_from_queue(future.event)
+                if isinstance(result, tuple):
+                    item_id, timestamp = result
+                else:
+                    item_id, timestamp = result, datetime.now()
 
-        log_message = f"Service {service.__class__.__name__} executed"
+                if item_id:
+                    if future_with_event.event:
+                        self.remove_event_from_running(future_with_event.event)
 
-        if future_with_event.event:
-            log_message += f" with {future_with_event.event.log_message}"
+                        logger.debug(
+                            f"Removed {future_with_event.event.log_message} from running events."
+                        )
 
-        logger.debug(log_message)
+                    if future_with_event.cancellation_event.is_set():
+                        logger.debug(
+                            f"Future with Item ID: {item_id} was cancelled; discarding results..."
+                        )
+
+                        return
+
+                    # Propagate overrides to the new event to maintain setting context across service transitions
+                    event_overrides = future_with_event.event.overrides if future_with_event.event else None
+
+                    self.add_event(
+                        Event(
+                            emitted_by=service,
+                            item_id=item_id,
+                            run_at=timestamp,
+                            overrides=event_overrides
+                        )
+                    )
+            except Exception as e:
+                logger.error(f"Error in future for {future_with_event}: {e}")
+                logger.exception(traceback.format_exc())
+
+                # TODO(spoked): Here we should remove it from the running events so it can be retried, right?
+                # self.remove_event_from_queue(future.event)
+
+            log_message = f"Service {service.__class__.__name__} executed"
+
+            if future_with_event.event:
+                log_message += f" with {future_with_event.event.log_message}"
+
+            logger.debug(log_message)
+        finally:
+            if is_scraping:
+                self._scraper_busy = False
 
     def add_event_to_queue(self, event: Event, log_message: bool = True):
         """
@@ -336,6 +343,9 @@ class EventManager:
 
         self._futures.append(future_with_event)
 
+        if service.__class__.__name__ == "Scraping":
+            self._scraper_busy = True
+
         sse_manager.publish_event(
             "event_update",
             json.dumps(self.get_event_updates()),
@@ -402,6 +412,10 @@ class EventManager:
         6. Retry Indexed items (scraped_times > 0 — previously failed retries)
         999. All other states
 
+        When the scraper is busy, Indexed events are held back so they don't pile up
+        in the executor's FIFO queue (which would bypass priority ordering). Non-scraping
+        work (downloads, symlinks, updates, expansions) continues unblocked.
+
         Within each priority level, events are sorted by run_at timestamp.
 
         Performance: Uses cached item_state and scraped_times from Event object to avoid database queries.
@@ -425,6 +439,18 @@ class EventManager:
 
                     if not ready_events:
                         raise Empty
+
+                    # When the scraper is already processing a job, hold back Indexed
+                    # events. They stay in the queue so fresh items can jump ahead of
+                    # retries when the scraper becomes free.
+                    if self._scraper_busy:
+                        ready_events = [
+                            event for event in ready_events
+                            if event.item_state != States.Indexed
+                        ]
+
+                        if not ready_events:
+                            raise Empty
 
                     # Define state priority (lower number = higher priority)
                     # Indexed is handled separately below to split fresh vs retry
