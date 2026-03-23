@@ -17,8 +17,8 @@ from program.db import db_functions
 from program.db.db import db_session
 from program.managers.sse_manager import sse_manager
 from program.media.item import MediaItem
-from program.types import Event, Service
 from program.media.state import States
+from program.types import Event, Service
 
 if TYPE_CHECKING:
     from program.program import Program
@@ -115,55 +115,38 @@ class EventManager:
                     )
                 else:
                     logger.debug(f"Future for {future_with_event} was cancelled.")
-                return  # Skip processing if the future was cancelled
+                return  # finally still runs
 
             try:
                 result = future_with_event.future.result()
-
-                if future_with_event in self._futures:
-                    self._futures.remove(future_with_event)
-
-                sse_manager.publish_event(
-                    "event_update", json.dumps(self.get_event_updates())
-                )
-
-                if isinstance(result, tuple):
-                    item_id, timestamp = result
-                else:
-                    item_id, timestamp = result, datetime.now()
-
-                if item_id:
-                    if future_with_event.event:
-                        self.remove_event_from_running(future_with_event.event)
-
-                        logger.debug(
-                            f"Removed {future_with_event.event.log_message} from running events."
-                        )
-
-                    if future_with_event.cancellation_event.is_set():
-                        logger.debug(
-                            f"Future with Item ID: {item_id} was cancelled; discarding results..."
-                        )
-
-                        return
-
-                    # Propagate overrides to the new event to maintain setting context across service transitions
-                    event_overrides = future_with_event.event.overrides if future_with_event.event else None
-
-                    self.add_event(
-                        Event(
-                            emitted_by=service,
-                            item_id=item_id,
-                            run_at=timestamp,
-                            overrides=event_overrides
-                        )
-                    )
             except Exception as e:
                 logger.error(f"Error in future for {future_with_event}: {e}")
                 logger.exception(traceback.format_exc())
+                return  # finally still runs
 
-                # TODO(spoked): Here we should remove it from the running events so it can be retried, right?
-                # self.remove_event_from_queue(future.event)
+            if isinstance(result, tuple):
+                item_id, timestamp = result
+            else:
+                item_id, timestamp = result, datetime.now()
+
+            if item_id:
+                if future_with_event.cancellation_event.is_set():
+                    logger.debug(
+                        f"Future with Item ID: {item_id} was cancelled; discarding results..."
+                    )
+                    return  # finally still runs
+
+                # Propagate overrides to the new event to maintain setting context across service transitions
+                event_overrides = future_with_event.event.overrides if future_with_event.event else None
+
+                self.add_event(
+                    Event(
+                        emitted_by=service,
+                        item_id=item_id,
+                        run_at=timestamp,
+                        overrides=event_overrides
+                    )
+                )
 
             log_message = f"Service {service.__class__.__name__} executed"
 
@@ -171,7 +154,24 @@ class EventManager:
                 log_message += f" with {future_with_event.event.log_message}"
 
             logger.debug(log_message)
+
         finally:
+            # Always clean up regardless of success, failure, or cancellation.
+            # NOTE: do NOT call remove_event_from_running anywhere else in this method
+            # to avoid a double-removal ValueError.
+            if future_with_event in self._futures:
+                self._futures.remove(future_with_event)
+
+            if future_with_event.event:
+                self.remove_event_from_running(future_with_event.event)
+                logger.debug(
+                    f"Removed {future_with_event.event.log_message} from running events."
+                )
+
+            sse_manager.publish_event(
+                "event_update", json.dumps(self.get_event_updates())
+            )
+
             if is_scraping:
                 self._scraper_busy = False
 
@@ -478,8 +478,6 @@ class EventManager:
                             else:
                                 priority = state_priority.get(event.item_state, 999)
                             return (priority, event.run_at)
-
-                        # Default priority for items without state or content-only events
                         return (0, event.run_at)
 
                     # Sort by priority (state first, then run_at)
