@@ -1350,8 +1350,17 @@ async def reindex_item(
                 # Merge the reindexed item back into the session
                 # Use no_autoflush to prevent SQLAlchemy from trying to flush
                 # the new Season/Episode objects before the merge is complete
+                reindexed = runner_result.media_items[0]
                 with s.no_autoflush:
-                    s.merge(runner_result.media_items[0])
+                    merged = s.merge(reindexed)
+                    # Explicitly add new seasons and episodes that merge doesn't cascade
+                    if hasattr(merged, "seasons"):
+                        for season in merged.seasons:
+                            if not s.object_session(season):
+                                s.add(season)
+                            for episode in getattr(season, "episodes", []):
+                                if not s.object_session(episode):
+                                    s.add(episode)
 
             apply_item_mutation(
                 program=di[Program],
@@ -1360,6 +1369,8 @@ async def reindex_item(
                 mutation_fn=mutation,
                 bubble_parents=True,
             )
+
+            session.commit()
 
             logger.info(f"Successfully re-indexed {item.log_string}")
 
