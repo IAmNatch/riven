@@ -1,3 +1,5 @@
+import random
+import time
 from datetime import datetime, timedelta
 from loguru import logger
 from RTN import ParsedData
@@ -32,6 +34,7 @@ from program.settings import settings_manager
 from program.utils.request import CircuitBreakerOpen
 from program.core.runner import MediaItemGenerator, Runner, RunnerResult
 
+from .torbox import TorBoxDownloader
 from .realdebrid import RealDebridDownloader
 from .debridlink import DebridLinkDownloader
 from .alldebrid import AllDebridDownloader
@@ -42,7 +45,9 @@ class Downloader(Runner[None, DownloaderBase]):
         super().__init__()
 
         self.initialized = False
+        # Insertion order defines priority: TorBox is tried first, Real-Debrid second.
         self.services = {
+            TorBoxDownloader: TorBoxDownloader(),
             RealDebridDownloader: RealDebridDownloader(),
             DebridLinkDownloader: DebridLinkDownloader(),
             AllDebridDownloader: AllDebridDownloader(),
@@ -66,6 +71,12 @@ class Downloader(Runner[None, DownloaderBase]):
             settings_manager.settings.post_processing.subtitle.enabled
         )
 
+        # Throttle: minimum seconds between download attempts to avoid API hammering
+        self._min_download_interval = 2.0
+        self._last_attempt_time: datetime | None = None
+        # Stagger counter for cooldown reschedules to prevent thundering herd
+        self._cooldown_stagger_offset = 0
+
     def validate(self):
         if not self.initialized_services:
             logger.error(
@@ -85,6 +96,14 @@ class Downloader(Runner[None, DownloaderBase]):
     ) -> MediaItemGenerator:
         logger.debug(f"Starting download process for {item.log_string} ({item.id})")
 
+        # Enforce minimum spacing between download attempts to avoid API hammering
+        if self._last_attempt_time is not None:
+            elapsed = (datetime.now() - self._last_attempt_time).total_seconds()
+            if elapsed < self._min_download_interval:
+                sleep_for = self._min_download_interval - elapsed
+                logger.debug(f"Throttling download: sleeping {sleep_for:.1f}s before processing {item.log_string}")
+                time.sleep(sleep_for)
+        self._last_attempt_time = datetime.now()
 
         # Check if all services are in cooldown due to circuit breaker
         now = datetime.now()
@@ -97,14 +116,18 @@ class Downloader(Runner[None, DownloaderBase]):
         ]
 
         if not available_services:
-            # All services are in cooldown, reschedule for the earliest available time
+            # All services are in cooldown, reschedule with staggered timing
+            # to prevent thundering herd when cooldown expires
             next_attempt = min(self._service_cooldowns.values())
+            self._cooldown_stagger_offset += 1
+            jitter = timedelta(seconds=self._cooldown_stagger_offset * 2 + random.uniform(0, 2))
+            staggered_attempt = next_attempt + jitter
 
             logger.warning(
-                f"All downloader services in cooldown for {item.log_string} ({item.id}), rescheduling for {next_attempt.strftime('%m/%d/%y %H:%M:%S')}"
+                f"All downloader services in cooldown for {item.log_string} ({item.id}), rescheduling for {staggered_attempt.strftime('%m/%d/%y %H:%M:%S')} (stagger #{self._cooldown_stagger_offset})"
             )
 
-            yield RunnerResult(media_items=[item], run_at=next_attempt)
+            yield RunnerResult(media_items=[item], run_at=staggered_attempt)
             return
 
         download_success = False
@@ -268,8 +291,9 @@ class Downloader(Runner[None, DownloaderBase]):
                     f"Failed to download any streams for {item.log_string} ({item.id})"
                 )
         else:
-            # Clear service cooldowns on successful download
+            # Clear service cooldowns and stagger counter on successful download
             self._service_cooldowns.clear()
+            self._cooldown_stagger_offset = 0
 
             yield RunnerResult(media_items=[item])
 
