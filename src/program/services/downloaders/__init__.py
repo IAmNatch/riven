@@ -568,6 +568,14 @@ class Downloader(Runner[None, DownloaderBase]):
             logger.debug(
                 f"Reusing torrent_id {torrent_id} from validation for {stream.infohash}"
             )
+        else:
+            # Services that validate via a no-add cache check (e.g. TorBox/checkcached)
+            # defer torrent creation to here, so cache-probing never creates torrents.
+            torrent_id = service.add_torrent(stream.infohash)
+
+            logger.debug(
+                f"Added torrent {torrent_id} at download time for {stream.infohash}"
+            )
 
         assert torrent_id
 
@@ -581,6 +589,19 @@ class Downloader(Runner[None, DownloaderBase]):
 
         if container.file_ids:
             service.select_files(torrent_id, container.file_ids)
+
+        # Backfill per-file download URLs for containers built without a torrent_id at
+        # validation time (the checkcached path): a file's URL only exists once the torrent
+        # has been added. Only fills missing URLs, so it's a no-op for services that already
+        # set them during validation.
+        if info and info.files:
+            for debrid_file in container.files:
+                if (
+                    not debrid_file.download_url
+                    and debrid_file.file_id is not None
+                    and debrid_file.file_id in info.files
+                ):
+                    debrid_file.download_url = info.files[debrid_file.file_id].download_url
 
         return DownloadedTorrent(
             id=torrent_id,
