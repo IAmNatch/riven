@@ -46,6 +46,51 @@ from .stream_connection import StreamConnection
 PROXY_REQUIRED_PROVIDERS = {"alldebrid"}
 
 
+# Providers whose streaming URL resolves through a per-token rate-limited
+# endpoint (e.g. TorBox `requestdl`, capped at 300/min per token). Connection
+# establishment for these is paced through a single process-wide token bucket so
+# a burst of concurrent opens (a Plex library scan) can't trip 429s.
+RATE_LIMITED_STREAM_PROVIDERS = {"torbox"}
+
+
+class _AsyncTokenBucket:
+    """Minimal trio-compatible token bucket shared across all MediaStream instances.
+
+    Lock and clock are created lazily on first acquire so the module-level
+    singleton is safe to construct at import time (outside any trio run).
+    """
+
+    def __init__(self, rate_per_sec: float, capacity: float) -> None:
+        self._rate = rate_per_sec
+        self._capacity = capacity
+        self._tokens = capacity
+        self._last: float | None = None
+        self._lock: trio.Lock | None = None
+
+    async def acquire(self) -> None:
+        if self._lock is None:
+            self._lock = trio.Lock()
+
+        while True:
+            async with self._lock:
+                now = trio.current_time()
+                if self._last is None:
+                    self._last = now
+                elapsed = now - self._last
+                self._last = now
+                self._tokens = min(self._capacity, self._tokens + elapsed * self._rate)
+                if self._tokens >= 1:
+                    self._tokens -= 1
+                    return
+                wait = (1 - self._tokens) / self._rate
+            await trio.sleep(wait)
+
+
+# 250/min stays under TorBox's 300/min per-token ceiling while leaving headroom
+# for the downloader's own requestdl/createtorrent calls.
+_STREAM_REQUESTDL_LIMITER = _AsyncTokenBucket(rate_per_sec=250 / 60, capacity=10)
+
+
 type ReadType = Literal[
     "header_scan",
     "footer_scan",
@@ -789,9 +834,15 @@ class MediaStream:
 
         max_attempts = 4
         backoffs = [0.2, 0.5, 1.0]
+        # TorBox sends no Retry-After; back off much harder on 429 so
+        # concurrent streams (e.g. a Plex library scan) space out.
+        rate_limit_backoffs = [2.0, 5.0, 10.0]
 
         for attempt in range(max_attempts):
             try:
+                if self.provider in RATE_LIMITED_STREAM_PROVIDERS:
+                    await _STREAM_REQUESTDL_LIMITER.acquire()
+
                 async with self.async_client.stream(
                     method="GET",
                     url=self.target_url.value,
@@ -895,7 +946,7 @@ class MediaStream:
                     if await self._retry_with_backoff(
                         attempt,
                         max_attempts,
-                        backoffs,
+                        rate_limit_backoffs,
                     ):
                         continue
 
