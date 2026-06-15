@@ -56,12 +56,26 @@ class DebridServiceServiceUnavailableException(DebridServiceException):
 
 
 class DebridServiceLinkUnavailable(DebridServiceException):
-    """Raised when a link is unavailable on the debrid service."""
+    """Raised when a link is unavailable on the debrid service.
 
-    def __init__(self, provider: str, link: str) -> None:
+    Optionally carries the underlying torrent identifier and whether this is the
+    first time the torrent was observed dead (as opposed to a cached repeat hit).
+    A dead torrent is typically a season pack shared by many media items, so the
+    first detection is the signal to reset all of them together in one pass.
+    """
+
+    def __init__(
+        self,
+        provider: str,
+        link: str,
+        torrent_id: str | None = None,
+        first_detection: bool = False,
+    ) -> None:
         super().__init__(f"Link {link} is unavailable or invalid", provider=provider)
 
         self.link = link
+        self.torrent_id = torrent_id
+        self.first_detection = first_detection
 
 
 class DebridServiceClosedConnectionException(DebridServiceException):

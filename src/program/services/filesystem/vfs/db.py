@@ -149,30 +149,12 @@ class VFSDatabase:
                     f"Failed to unrestrict URL for {entry.original_filename}: {e}"
                 )
 
-                # If un-restricting fails, reset the MediaItem to trigger a new download
-                if entry.media_item:
-                    item_id = entry.media_item.id
-
-                    def mutation(i: MediaItem, s: Session):
-                        i.blacklist_active_stream()
-                        i.reset()
-
-                    apply_item_mutation(
-                        program=di[Program],
-                        item=entry.media_item,
-                        mutation_fn=mutation,
-                        session=session,
-                    )
-
-                    session.commit()
-
-                    di[Program].em.add_event(
-                        Event(
-                            "VFS",
-                            item_id,
-                        )
-                    )
-
+                # A dead/evicted torrent is usually a season pack shared by many media items.
+                # On the FIRST detection (the downloader flags the torrent and reports it via the
+                # exception), reset every sibling sharing that torrent in one pass so the whole
+                # pack blacklists + re-scrapes together instead of one item per VFS read.
+                # Otherwise fall back to resetting just this item.
+                if self._reset_items_for_dead_link(entry, session, e):
                     return None
                 raise
             except Exception as e:
@@ -181,6 +163,92 @@ class VFSDatabase:
                 )
 
         return None
+
+    def _reset_items_for_dead_link(
+        self,
+        entry: MediaEntry,
+        session: Session,
+        error: DebridServiceLinkUnavailable,
+    ) -> bool:
+        """
+        Reset the MediaItem(s) affected by a dead debrid link so they re-scrape.
+
+        When the link failure is the first detection of a dead torrent (a shared season pack),
+        every MediaEntry pointing at the same provider torrent is reset together in a single
+        pass; siblings then collapse at once rather than one-per-VFS-read. Otherwise only this
+        entry's item is reset.
+
+        Each affected item is blacklisted (so the dead pack is not re-picked, which would also
+        waste a createtorrent token) and reset (so it re-scrapes to a different source).
+
+        Returns:
+            True if at least one item was reset; False if there was no item to reset (caller
+            should re-raise so the failure is not silently swallowed).
+        """
+
+        from program.program import Program
+
+        # torrent_id is carried on the exception; the provider torrent on the MediaEntry is
+        # stored as provider_download_id. Prefer the column for the sibling lookup.
+        torrent_id = getattr(error, "torrent_id", None)
+        first_detection = getattr(error, "first_detection", False)
+
+        items: list[MediaItem] = []
+
+        if (
+            first_detection
+            and entry.provider
+            and entry.provider_download_id
+        ):
+            # Reset all siblings sharing this exact provider torrent.
+            sibling_entries = (
+                session.query(MediaEntry)
+                .filter(
+                    MediaEntry.provider == entry.provider,
+                    MediaEntry.provider_download_id == entry.provider_download_id,
+                )
+                .all()
+            )
+
+            seen: set = set()
+
+            for sibling in sibling_entries:
+                item = sibling.media_item
+
+                if item is not None and item.id not in seen:
+                    seen.add(item.id)
+                    items.append(item)
+
+            logger.warning(
+                f"Dead TorBox torrent {torrent_id or entry.provider_download_id}: resetting "
+                f"{len(items)} item(s) sharing the pack so they re-scrape together"
+            )
+        elif entry.media_item is not None:
+            items = [entry.media_item]
+
+        if not items:
+            return False
+
+        def mutation(i: MediaItem, s: Session):
+            i.blacklist_active_stream()
+            i.reset()
+
+        item_ids = [item.id for item in items]
+
+        for item in items:
+            apply_item_mutation(
+                program=di[Program],
+                item=item,
+                mutation_fn=mutation,
+                session=session,
+            )
+
+        session.commit()
+
+        for item_id in item_ids:
+            di[Program].em.add_event(Event("VFS", item_id))
+
+        return True
 
     def get_entry_by_original_filename(
         self,

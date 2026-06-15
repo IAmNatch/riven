@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import time
 from datetime import datetime
+from threading import Lock
 from typing import Any
 
 from loguru import logger
@@ -55,6 +57,83 @@ CONTROL_RATE_PER_MIN = 200       # checkcached/mylist/createtorrent/controltorre
 STREAM_RATE_PER_MIN = 90         # requestdl only (low-volume; isolated breaker) -> 290 total
 DOMAIN_BURST = 5                 # small burst allowance per session
 CREATETORRENT_PER_HOUR = 58      # createtorrent only; under the 60/hour cap for safety margin
+
+# Dead-torrent negative cache. A dead/evicted TorBox season pack is ONE torrent shared by N
+# media items (via StreamRelation); each item's MediaEntry re-resolves its own requestdl link.
+# Without this guard, every sibling independently 404/500s on requestdl -> trips the stream
+# breaker -> resets+re-scrapes -> can re-add the same dead pack (burning a createtorrent token
+# against the 58/hour cap). This short-lived, torrent_id-keyed cache lets the FIRST dead
+# detection stand in for the rest: siblings raise DebridServiceLinkUnavailable immediately with
+# NO network call until they reset out of the VFS.
+#
+# TTL (not permanent) because TorBox eviction can be temporary (re-cache); this is only a
+# hammer-guard. The DURABLE "don't re-pick this torrent" is StreamBlacklistRelation via
+# blacklist_active_stream() in the VFS reset path, not this cache.
+DEAD_TORRENT_TTL = 600           # seconds a torrent_id stays flagged dead (10 min)
+DEAD_TORRENT_MAX = 4096          # bound the cache so it can't grow without limit
+
+
+class DeadTorrentCache:
+    """Thread-safe, TTL-bounded set of torrent_ids known to be gone from TorBox.
+
+    VFS reads are multi-threaded, so all access is guarded by a lock. Entries expire after
+    `ttl` seconds; the cache is capped at `max_size` (soonest-to-expire entry is dropped when
+    full) so a long uptime with many distinct dead torrents cannot leak memory.
+    """
+
+    def __init__(self, ttl: float = DEAD_TORRENT_TTL, max_size: int = DEAD_TORRENT_MAX) -> None:
+        self._ttl = ttl
+        self._max_size = max_size
+        self._dead: dict[str, float] = {}  # torrent_id -> monotonic expiry timestamp
+        self._lock = Lock()
+
+    def contains(self, torrent_id: str) -> bool:
+        """True if `torrent_id` is currently flagged dead (lazily evicts if expired)."""
+
+        now = time.monotonic()
+
+        with self._lock:
+            expiry = self._dead.get(torrent_id)
+
+            if expiry is None:
+                return False
+
+            if expiry <= now:
+                del self._dead[torrent_id]
+
+                return False
+
+            return True
+
+    def add(self, torrent_id: str) -> bool:
+        """Flag `torrent_id` dead (refreshing its TTL).
+
+        Returns True if this is the first live detection (it was absent or expired), which is
+        the signal to reset every sibling sharing the torrent in one pass.
+        """
+
+        now = time.monotonic()
+
+        with self._lock:
+            self._evict_expired(now)
+
+            if torrent_id not in self._dead and len(self._dead) >= self._max_size:
+                soonest = min(self._dead, key=self._dead.__getitem__)
+                del self._dead[soonest]
+
+            previous = self._dead.get(torrent_id)
+            first_detection = previous is None or previous <= now
+            self._dead[torrent_id] = now + self._ttl
+
+            return first_detection
+
+    def _evict_expired(self, now: float) -> None:
+        """Drop expired entries. Caller must hold the lock."""
+
+        expired = [tid for tid, expiry in self._dead.items() if expiry <= now]
+
+        for tid in expired:
+            del self._dead[tid]
 
 
 class TorBoxError(Exception):
@@ -132,6 +211,10 @@ class TorBoxAPI:
             capacity=1,
             name="api.torbox.app/createtorrent",
         )
+
+        # Negative cache of torrent_ids that requestdl reported gone (404/500). Short-circuits
+        # repeated link resolution for every other media item sharing a dead season pack.
+        self.dead_torrents = DeadTorrentCache()
 
         try:
             version = get_version()
@@ -613,8 +696,8 @@ class TorBoxDownloader(DownloaderBase):
             UnrestrictedLink with the direct download URL, or None on error.
 
         Raises:
-            DebridServiceLinkUnavailable: When the underlying torrent/file is gone (404),
-                so the VFS layer can trigger a fresh download.
+            DebridServiceLinkUnavailable: When the underlying torrent/file is gone (404/500),
+                so the VFS layer can blacklist the dead pack and trigger a fresh download.
         """
 
         try:
@@ -625,6 +708,21 @@ class TorBoxDownloader(DownloaderBase):
             if torrent_id_str is None or file_id_str is None:
                 logger.debug(f"TorBox unrestrict: cannot parse handle: {link}")
                 return None
+
+            # Fast path: a sibling already proved this torrent dead. Raise immediately with no
+            # network call (and no stream-breaker hit) so the whole pack collapses on the first
+            # detection instead of once-per-episode.
+            if self.api.dead_torrents.contains(torrent_id_str):
+                logger.debug(
+                    f"TorBox torrent {torrent_id_str} is flagged dead (cache hit); "
+                    f"signalling re-download without a requestdl call"
+                )
+                raise DebridServiceLinkUnavailable(
+                    provider=self.key,
+                    link=link,
+                    torrent_id=torrent_id_str,
+                    first_detection=False,
+                )
 
             # requestdl goes through the isolated stream session, so its failures trip the
             # stream breaker only -- never the control breaker that gates downloads/availability.
@@ -639,17 +737,25 @@ class TorBoxDownloader(DownloaderBase):
 
             # 404, or a 500 DATABASE_ERROR, means the torrent is gone from the account (TorBox
             # returns either for an evicted torrent -- and crucially mylist 500s for it too, so
-            # there is no reliable presence check). Signal the VFS to re-download so the entry
-            # self-heals. We deliberately do NOT probe the control session here: routing an
-            # evicted-torrent check through it would trip the control breaker, defeating the whole
-            # point of the separate stream session. The stream breaker absorbs these 5xx in
-            # isolation, so downloads/availability keep working.
+            # there is no reliable presence check). Flag it dead so siblings short-circuit, then
+            # signal the VFS to blacklist + re-download so the entry self-heals. We deliberately
+            # do NOT probe the control session here: routing an evicted-torrent check through it
+            # would trip the control breaker, defeating the whole point of the separate stream
+            # session. The stream breaker absorbs these 5xx in isolation, so downloads/availability
+            # keep working.
             if response.status_code in (404, 500):
+                first_detection = self.api.dead_torrents.add(torrent_id_str)
                 logger.warning(
                     f"TorBox link unavailable ({response.status_code}) for handle {link}; "
+                    f"flagged torrent {torrent_id_str} dead (first_detection={first_detection}), "
                     f"signalling re-download"
                 )
-                raise DebridServiceLinkUnavailable(provider=self.key, link=link)
+                raise DebridServiceLinkUnavailable(
+                    provider=self.key,
+                    link=link,
+                    torrent_id=torrent_id_str,
+                    first_detection=first_detection,
+                )
 
             # Other transient 429/5xx (e.g. 502/503) -> stream-breaker backoff signal, retried later.
             self._maybe_backoff(response)
