@@ -908,8 +908,18 @@ class MediaStream:
                         continue
 
                     raise DebridServiceForbiddenException(provider=self.provider) from e
-                elif status_code in (HTTPStatus.NOT_FOUND, HTTPStatus.GONE, HTTPStatus.SERVICE_UNAVAILABLE):
-                    # File can't be found at this URL; try refreshing the URL once
+                elif status_code in (
+                    HTTPStatus.NOT_FOUND,
+                    HTTPStatus.GONE,
+                    HTTPStatus.BAD_GATEWAY,
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    HTTPStatus.GATEWAY_TIMEOUT,
+                ):
+                    # The cached download URL is stale/unusable; try refreshing it once.
+                    # 404/410: file gone from this URL. 502/503/504: TorBox returns a
+                    # gateway error for an EXPIRED signed CDN URL (the link resolves but
+                    # the node won't serve it) -- re-resolving via requestdl yields a fresh,
+                    # working URL, so these must refresh rather than fail as "transient".
                     if attempt == 0:
                         has_fresh_url = await self._refresh_download_url()
 
