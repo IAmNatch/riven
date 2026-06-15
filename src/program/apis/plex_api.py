@@ -1,4 +1,5 @@
-﻿from typing import Literal, cast
+﻿import time
+from typing import Literal, cast
 from pydantic import BaseModel, field_validator
 import regex
 from loguru import logger
@@ -13,6 +14,17 @@ from program.utils.request import SmartSession
 
 TMDBID_REGEX = regex.compile(r"tmdb://(\d+)")
 TVDBID_REGEX = regex.compile(r"tvdb://(\d+)")
+
+# Backpressure for path-scoped section refreshes. section.update() is
+# fire-and-forget: it returns immediately while Plex scans asynchronously. When
+# many items complete at once (e.g. a multi-season show, or a download backlog
+# draining), the Updater would fire a flood of refreshes that Plex runs
+# overlapping -- opening many files on the debrid VFS simultaneously and getting
+# the debrid provider rate-limited (429s). To prevent that we wait for each scan
+# to finish before returning. Combined with the single-threaded Updater executor
+# (max_workers=1), this serializes the whole burst into one scan at a time.
+SECTION_REFRESH_POLL_INTERVAL = 2.0   # seconds between "is it still scanning?" checks
+SECTION_REFRESH_MAX_WAIT = 180.0      # cap so a foreign/stuck scan can't block forever
 
 
 class GuidModel(BaseModel):
@@ -273,13 +285,44 @@ class PlexAPI:
         return watchlist_items
 
     def update_section(self, section: LibrarySection, path: str) -> bool:
-        """Update the Plex section for the given path"""
+        """Update the Plex section for the given path.
+
+        Triggers a path-scoped scan, then blocks (bounded by
+        SECTION_REFRESH_MAX_WAIT) until Plex reports the section is no longer
+        refreshing. This applies backpressure so the single-threaded Updater
+        paces completion bursts one scan at a time instead of firing overlapping
+        scans that hammer the debrid VFS. See SECTION_REFRESH_* above.
+        """
         try:
             section.update(str(path))
-            return True
         except Exception as e:
             logger.error(f"Failed to update Plex section for path {path}: {e}")
             return False
+
+        self._wait_for_section_idle(section)
+        return True
+
+    def _wait_for_section_idle(self, section: LibrarySection) -> None:
+        """Poll until the section finishes its scan, capped at SECTION_REFRESH_MAX_WAIT.
+
+        Best-effort: any polling failure is swallowed so it can never break the
+        update path. An initial sleep gives Plex a moment to flip `refreshing`
+        to True before we start checking, avoiding a premature exit.
+        """
+        waited = 0.0
+        try:
+            while waited < SECTION_REFRESH_MAX_WAIT:
+                time.sleep(SECTION_REFRESH_POLL_INTERVAL)
+                waited += SECTION_REFRESH_POLL_INTERVAL
+                section.reload()
+                if not getattr(section, "refreshing", False):
+                    return
+            logger.warning(
+                f"Plex section '{getattr(section, 'title', '?')}' still refreshing "
+                f"after {SECTION_REFRESH_MAX_WAIT:.0f}s; proceeding without waiting longer"
+            )
+        except Exception as e:
+            logger.debug(f"Could not poll Plex section refresh state: {e}")
 
     def map_sections_with_paths(self) -> dict[LibrarySection, list[str]]:
         """Map Plex sections with their paths"""
