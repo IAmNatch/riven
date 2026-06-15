@@ -38,9 +38,16 @@ class AsyncClient(httpx.AsyncClient):
             self.event_hooks["response"].append(self.log_response)
 
     async def raise_on_4xx_5xx(self, response: httpx.Response) -> None:
-        """Raise an error if the response status code indicates an error."""
+        """Raise on real errors only.
 
-        response.raise_for_status()
+        This hook fires on every response, including intermediate redirect
+        responses. Calling raise_for_status() unconditionally raises on 3xx
+        (e.g. TorBox requestdl's 307 -> CDN), defeating follow_redirects=True.
+        Guard on >= 400 so redirects are followed and only 4xx/5xx raise.
+        """
+
+        if response.status_code >= 400:
+            response.raise_for_status()
 
     async def log_request(self, request: httpx.Request) -> None:
         """Log the HTTP request details.
