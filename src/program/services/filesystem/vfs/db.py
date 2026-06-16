@@ -6,6 +6,7 @@ from kink import di
 from loguru import logger
 
 from pydantic import BaseModel
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 from program.db.db import db_session
 from program.media.media_entry import MediaEntry
@@ -233,19 +234,44 @@ class VFSDatabase:
             i.blacklist_active_stream()
             i.reset()
 
-        item_ids = [item.id for item in items]
+        # Reset each item inside its own SAVEPOINT. A sibling can have a job (e.g. a Downloader
+        # event from the startup backlog) still running despite cancel_job -- its concurrent
+        # StreamRelation delete races ours and raises StaleDataError ("expected to delete 1
+        # row(s); Only 0 were matched"). With a single batch commit, one such race rolls back the
+        # whole pack and poisons the session (PendingRollbackError). The savepoint contains the
+        # failure to just that item: it is skipped (the row is gone either way) and gets retried
+        # via its normal event flow, while the rest of the pack still collapses.
+        succeeded_ids: list[int] = []
 
         for item in items:
-            apply_item_mutation(
-                program=di[Program],
-                item=item,
-                mutation_fn=mutation,
-                session=session,
-            )
+            item_id = item.id
+
+            try:
+                with session.begin_nested():
+                    apply_item_mutation(
+                        program=di[Program],
+                        item=item,
+                        mutation_fn=mutation,
+                        session=session,
+                    )
+
+                succeeded_ids.append(item_id)
+            except SQLAlchemyError as e:
+                # Savepoint already rolled back by the context manager; outer txn stays usable.
+                logger.warning(
+                    f"Skipped resetting item {item_id} for dead torrent "
+                    f"{torrent_id or entry.provider_download_id} "
+                    f"(concurrent stream mutation): {e}"
+                )
+
+        if not succeeded_ids:
+            # Every item raced; nothing committed. Let the caller re-raise so the read fails
+            # cleanly and the items retry, rather than reporting a successful reset.
+            return False
 
         session.commit()
 
-        for item_id in item_ids:
+        for item_id in succeeded_ids:
             di[Program].em.add_event(Event("VFS", item_id))
 
         return True
