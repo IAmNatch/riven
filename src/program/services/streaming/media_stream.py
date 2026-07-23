@@ -909,6 +909,7 @@ class MediaStream:
 
                     raise DebridServiceForbiddenException(provider=self.provider) from e
                 elif status_code in (
+                    HTTPStatus.BAD_REQUEST,
                     HTTPStatus.NOT_FOUND,
                     HTTPStatus.GONE,
                     HTTPStatus.BAD_GATEWAY,
@@ -916,6 +917,9 @@ class MediaStream:
                     HTTPStatus.GATEWAY_TIMEOUT,
                 ):
                     # The cached download URL is stale/unusable; try refreshing it once.
+                    # 400: TorBox's CDN rejects an expired/malformed signed URL with a bare
+                    # 400 (no body) -- the file is fine, the signature has rotted, so a
+                    # re-resolve via requestdl yields a working URL just like the 5xx cases.
                     # 404/410: file gone from this URL. 502/503/504: TorBox returns a
                     # gateway error for an EXPIRED signed CDN URL (the link resolves but
                     # the node won't serve it) -- re-resolving via requestdl yields a fresh,
